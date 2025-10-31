@@ -1,4 +1,4 @@
-<<<<<<< HEAD
+
 # Intune PowerShell Automation Lab
 
 This repository contains PowerShell automation scripts for Microsoft Intune and Microsoft Graph.  
@@ -30,11 +30,6 @@ Each project consists of a `.md` specification file and a `.ps1` implementation 
 2. Authenticate with SSO (Connect-MgGraph).
 3. Follow the prompts in the terminal.
 
----
-
-## 📄 Notes
-All `.md` files describe what Copilot should generate, including constraints and rules (no external code, no online fetching).
 =======
 # IntuneScripts
 Folder for my personal scripts that i use for Intune
->>>>>>> 94e36608719b9be9974bae0a511e849f8eb01da3

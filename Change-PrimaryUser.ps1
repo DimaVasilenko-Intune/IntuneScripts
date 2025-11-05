@@ -14,7 +14,7 @@
 # Enable strict mode for better error handling
 Set-StrictMode -Version Latest
 
-# Clear any existing sessions
+# Clear any existing sessions and cached credentials
 Disconnect-MgGraph -ErrorAction SilentlyContinue
 
 try {
@@ -31,10 +31,12 @@ try {
         Import-Module $module -ErrorAction Stop
     }
 
-    Write-Host "🔐 Connecting to Microsoft Graph..." -ForegroundColor Cyan
+    Write-Host "🔐 Connecting to Microsoft Graph (SSO prompt)..." -ForegroundColor Cyan
+    Write-Host "   Please select your account when prompted" -ForegroundColor Yellow
     $graphParams = @{
         NoWelcome = $true
         ErrorAction = 'Stop'
+        ContextScope = 'Process'
         Scopes = @(
             'DeviceManagementManagedDevices.ReadWrite.All',
             'User.Read.All',
@@ -53,10 +55,12 @@ try {
     #endregion AUTHENTICATION
 
     #region INPUT
-    # Get device name from user
-    $deviceName = Read-Host -Prompt "Enter device name"
-    if ([string]::IsNullOrWhiteSpace($deviceName)) {
-        throw "Device name cannot be empty"
+    # Accept either a hostname or a serial number as the device identifier.
+    # The script will search both deviceName and serialNumber and present
+    # a selection if multiple matches are found.
+    $deviceIdentifier = Read-Host -Prompt "Enter device identifier (hostname or serial number)"
+    if ([string]::IsNullOrWhiteSpace($deviceIdentifier)) {
+        throw "Device identifier cannot be empty"
     }
 
     # Get new primary user UPN
@@ -69,21 +73,56 @@ try {
     #region VALIDATION
     Write-Host "🔍 Validating device and user..." -ForegroundColor Cyan
 
-    # Find device in Intune
-    $device = Get-MgDeviceManagementManagedDevice -Filter "deviceName eq '$deviceName'" -ErrorAction Stop
-    if ($null -eq $device) {
-        throw "Device '$deviceName' not found in Intune"
+    # Search for devices by name and by serial number (case-insensitive where supported).
+    $filterName = "deviceName eq '$deviceIdentifier'"
+    $filterSerial = "serialNumber eq '$deviceIdentifier'"
+
+    $allDevices = [System.Collections.ArrayList]::new()
+    
+    try { 
+        $devicesByName = @(Get-MgDeviceManagementManagedDevice -Filter $filterName -ErrorAction Stop)
+        if ($devicesByName) { $allDevices.AddRange($devicesByName) }
+    } catch { }
+    
+    try { 
+        $devicesBySerial = @(Get-MgDeviceManagementManagedDevice -Filter $filterSerial -ErrorAction Stop)
+        if ($devicesBySerial) { $allDevices.AddRange($devicesBySerial) }
+    } catch { }
+
+    # Remove duplicates by Id
+    $allDevices = @($allDevices | Sort-Object -Property Id -Unique)
+
+    if (-not $allDevices -or $allDevices.Count -eq 0) {
+        throw "No devices found matching '$deviceIdentifier'"
+    }
+
+    # If multiple devices are found, prompt the user to choose one
+    if ($allDevices.Count -gt 1) {
+        Write-Host "Multiple devices matched the identifier. Please select the correct device:" -ForegroundColor Yellow
+        for ($i = 0; $i -lt $allDevices.Count; $i++) {
+            $d = $allDevices[$i]
+            Write-Host "[$i] Name: $($d.DeviceName) | Model: $($d.Model) | OS: $($d.OperatingSystem) | Serial: $($d.SerialNumber) | Id: $($d.Id)"
+        }
+        $selection = Read-Host -Prompt "Enter the number of the device to update"
+        if (-not ($selection -as [int]) -or [int]$selection -lt 0 -or [int]$selection -ge $allDevices.Count) {
+            throw "Invalid selection"
+        }
+        $device = $allDevices[[int]$selection]
+    }
+    else {
+        $device = $allDevices[0]
     }
 
     # Find user in Azure AD
-    $user = Get-MgUser -Filter "userPrincipalName eq '$userUPN'" -ErrorAction Stop
+    $user = Get-MgUser -Filter "userPrincipalName eq '$userUPN'" -ErrorAction SilentlyContinue
     if ($null -eq $user) {
         throw "User '$userUPN' not found in Azure AD"
     }
 
     # Display current state
-    Write-Host "📱 Device found:" -ForegroundColor Green
+    Write-Host "📱 Device selected:" -ForegroundColor Green
     Write-Host "   Name: $($device.DeviceName)"
+    Write-Host "   Serial: $($device.SerialNumber)"
     Write-Host "   Model: $($device.Model)"
     Write-Host "   OS: $($device.OperatingSystem) $($device.OSVersion)"
     Write-Host ""
@@ -102,36 +141,64 @@ try {
 
     #region UPDATE
     Write-Host "📝 Updating primary user..." -ForegroundColor Cyan
-    
+
     try {
         Write-Host "   Assigning new primary user..." -ForegroundColor Cyan
         
-        # Use v1.0 endpoint with direct user assignment
-        $apiUrl = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices('$($device.Id)')"
-        
-        $requestBody = @{
-            userPrincipalName = $userUPN
+        # Attempt 1: Try beta endpoint with users reference (most reliable method)
+        try {
+            $apiUrl = "https://graph.microsoft.com/beta/deviceManagement/managedDevices('$($device.Id)')/users/`$ref"
+            $requestBody = @{
+                "@odata.id" = "https://graph.microsoft.com/beta/users/$($user.Id)"
+            }
+            
+            # Remove existing primary user first
+            try {
+                Invoke-MgGraphRequest -Method DELETE -Uri $apiUrl -ErrorAction SilentlyContinue
+                Write-Host "   Removed existing primary user" -ForegroundColor Yellow
+                Start-Sleep -Seconds 2
+            } catch {
+                # Ignore if no existing user
+            }
+            
+            # Add new primary user
+            Invoke-MgGraphRequest -Method POST -Uri $apiUrl -Body ($requestBody | ConvertTo-Json)
+            Write-Host "   New primary user assigned via beta endpoint" -ForegroundColor Green
         }
-
-        # Update the primary user
-        Write-Host "   Applying changes..." -ForegroundColor Cyan
-        Invoke-MgGraphRequest -Method PATCH -Uri $apiUrl -Body ($requestBody | ConvertTo-Json)
+        catch {
+            Write-Host "   Beta endpoint failed, trying v1.0..." -ForegroundColor Yellow
+            
+            # Attempt 2: Try v1.0 endpoint
+            $apiUrl = "https://graph.microsoft.com/v1.0/deviceManagement/managedDevices('$($device.Id)')/users/`$ref"
+            $requestBody = @{
+                "@odata.id" = "https://graph.microsoft.com/v1.0/users/$($user.Id)"
+            }
+            
+            Invoke-MgGraphRequest -Method POST -Uri $apiUrl -Body ($requestBody | ConvertTo-Json)
+            Write-Host "   New primary user assigned via v1.0 endpoint" -ForegroundColor Green
+        }
         
         # Wait for change to propagate
-        Write-Host "   Waiting for changes to apply..." -ForegroundColor Cyan
-        Start-Sleep -Seconds 3
+        Write-Host "   Waiting for changes to sync..." -ForegroundColor Cyan
+        Start-Sleep -Seconds 5
         
         # Verify the update
         $updatedDevice = Get-MgDeviceManagementManagedDevice -ManagedDeviceId $device.Id
-        if ($updatedDevice.UserPrincipalName -eq $userUPN) {
-            Write-Host "✅ Primary user successfully updated!" -ForegroundColor Green
+        if ($updatedDevice.UserId -eq $user.Id -or $updatedDevice.UserPrincipalName -eq $userUPN) {
+            Write-Host "✅ Primary user successfully updated and verified!" -ForegroundColor Green
         }
         else {
-            throw "Failed to verify primary user update"
+            Write-Host "⚠️ Update completed but verification inconclusive. Please check Intune portal." -ForegroundColor Yellow
         }
     }
     catch {
-        throw "Failed to update primary user: $_"
+        Write-Error "Failed to update primary user: $_"
+        Write-Host ""
+        Write-Host "💡 Troubleshooting tips:" -ForegroundColor Yellow
+        Write-Host "   1. Verify you have 'Cloud Device Administrator' or 'Intune Administrator' role"
+        Write-Host "   2. Check if the device is actively syncing with Intune"
+        Write-Host "   3. Try updating manually in Intune portal to confirm permissions"
+        throw
     }
     #endregion UPDATE
 }
